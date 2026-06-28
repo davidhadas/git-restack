@@ -1,0 +1,36 @@
+# ci.yml
+#
+# PURPOSE: Run tests and linting on every push and pull request.
+#
+# USAGE: Copy this file into .github/workflows/ of your repo.
+#        Runs only in the origin repo — no-op in forks.
+#        Forks typically lack the secrets and infrastructure required for CI.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Only run in the origin repo — no-op in forks.
+if: github.event.repository.fork == false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: echo "Add your setup steps here (install deps, configure toolchain, etc.)"
+
+      - name: Run tests
+        run: echo "Add your test command here (e.g. make test, pytest, npm test)"
+
+      - name: Lint
+        run: echo "Add your lint command here (e.g. make lint, ruff check, eslint)"

@@ -1,0 +1,117 @@
+# restack-prs.yml
+#
+# PURPOSE: Automatically restack all fork branches when main is updated.
+#
+# USAGE: Add this file to .github/workflows/ in the origin repo.
+#        Forks inherit it automatically when they sync main.
+#        It is a no-op in the origin repo (guarded by repository.fork).
+#        No secrets, tokens, or configuration required by anyone —
+#        GitHub provides GITHUB_TOKEN automatically to every workflow run.
+#
+# ON SUCCESS: branch is restacked and pushed. PR can be merged normally.
+# ON CONFLICT: branch is left untouched. A comment is posted on the PR and
+#        a failed commit status blocks merging until the author resolves it.
+#
+# CONFLICT RESOLUTION (author):
+#   git pull
+#   git restack              # hits conflict locally
+#   # fix conflicts in editor
+#   git add .
+#   git restack --continue   # completes the cherry-pick
+#   git push --force-with-lease origin <branch>
+
+name: Restack fork branches
+
+on:
+  push:
+    branches:
+      - main
+
+# Only run in forks — no-op in the origin repo.
+# github.event.repository.fork is set automatically by GitHub; no hardcoding needed.
+if: github.event.repository.fork == true
+
+permissions:
+  contents: write
+  statuses: write
+  pull-requests: write
+
+jobs:
+  restack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install git-restack
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/davidhadas/git-restack/main/git-restack \
+            -o /usr/local/bin/git-restack
+          chmod +x /usr/local/bin/git-restack
+
+      - name: Configure git
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Restack all branches
+        run: |
+          git fetch --all
+
+          for branch in $(git branch -r | grep -v 'origin/main' | grep -v 'HEAD' | sed 's|origin/||'); do
+            [ "$branch" = "main" ] && continue
+
+            echo "--- Restacking $branch ---"
+            git checkout "$branch" 2>/dev/null || {
+              echo "SKIP $branch: could not checkout"
+              continue
+            }
+
+            # Get the latest commit SHA on this branch (used for status checks)
+            sha=$(git rev-parse HEAD)
+
+            if git restack --auto-cleanup; then
+              git push --force-with-lease origin "$branch"
+              echo "OK $branch restacked and pushed."
+
+              # Post a passing status so any previous conflict block is cleared
+              gh api repos/${{ github.repository }}/statuses/$sha \
+                -f state=success \
+                -f context="git-restack" \
+                -f description="Branch successfully restacked on main"
+
+            else
+              echo "CONFLICT $branch: leaving branch untouched."
+
+              # Post a failing status to block merging
+              gh api repos/${{ github.repository }}/statuses/$sha \
+                -f state=failure \
+                -f context="git-restack" \
+                -f description="Conflict detected — run git restack locally to resolve"
+
+              # Post a comment on the PR if one exists for this branch
+              pr_number=$(gh pr list --head "$branch" --json number --jq '.[0].number' 2>/dev/null)
+              if [ -n "$pr_number" ] && [ "$pr_number" != "null" ]; then
+                gh pr comment "$pr_number" --body \
+                  "⚠️ **Auto-restack conflict detected**
+
+This branch could not be automatically restacked on the latest \`main\`. The branch has been left untouched.
+
+**To resolve locally:**
+\`\`\`sh
+git pull
+git restack              # hits conflict — shows the conflicting files
+# fix conflicts in your editor
+git add .
+git restack --continue   # completes the restack
+git push --force-with-lease origin $branch
+\`\`\`"
+              fi
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

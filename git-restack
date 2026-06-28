@@ -1,0 +1,258 @@
+#!/bin/bash
+set -e
+
+VERSION="1.0.0"
+BASE_BRANCH="main"
+
+show_help() {
+  echo "git restack — safely replay exactly one commit on top of '$BASE_BRANCH'"
+  echo ""
+  echo "Usage:"
+  echo "  git restack [base]                     Replay the single commit not in base (default: $BASE_BRANCH)"
+  echo "  git restack --continue                 Complete a restack after resolving conflicts manually"
+  echo "  git restack --dry-run [base]           Simulate the replay without touching your branch or local base"
+  echo "  git restack --auto-cleanup [base]      Delete the backup ref after a successful restack"
+  echo "  git restack --help                     Show this help message"
+  echo "  git restack --version                  Show version"
+  echo ""
+  echo "Notes:"
+  echo "  - Requires exactly ONE commit on your branch that is not in base."
+  echo "  - A backup ref 'backup/<branch>-<epoch>' is created before any destructive step."
+  echo "  - Works whether or not your feature branch has been pushed."
+  echo "  - This script NEVER pushes for you; it prints the right push command at the end."
+  echo "  - After a restack, use 'git push --force-with-lease' rather than '--force'."
+  echo "    --force-with-lease fails safely if someone else pushed to the branch since"
+  echo "    your last fetch, preventing accidental overwrites of others' work."
+  echo "  - Use --auto-cleanup in automated pipelines to delete the backup ref after"
+  echo "    a successful restack, keeping the remote free of stale backup branches."
+  echo "    On conflict or error the backup ref is always preserved for recovery."
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+DRY_RUN=0
+AUTO_CLEANUP=0
+CONTINUE=0
+while true; do
+  case "$1" in
+    --help|-h)
+      show_help
+      exit 0
+      ;;
+    --version|-V)
+      echo "git-restack $VERSION"
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --auto-cleanup)
+      AUTO_CLEANUP=1
+      shift
+      ;;
+    --continue)
+      CONTINUE=1
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# --continue: resume after a conflict was resolved manually
+# ---------------------------------------------------------------------------
+if [ "$CONTINUE" -eq 1 ]; then
+  GIT_DIR=$(git rev-parse --git-dir)
+  if [ ! -f "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+    echo "ERROR: No cherry-pick in progress. Nothing to continue."
+    echo "Run 'git restack' to start a fresh restack."
+    exit 1
+  fi
+  if ! git diff --quiet; then
+    echo "ERROR: You have unstaged changes. Stage all resolved files first:"
+    echo "  git add <files>"
+    exit 1
+  fi
+  echo "Continuing restack..."
+  git cherry-pick --continue
+  echo ""
+  echo "Restack complete. Push your branch with:"
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if git rev-parse --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH" >/dev/null; then
+    echo "  git push --force-with-lease origin $CURRENT_BRANCH"
+  else
+    echo "  git push -u origin $CURRENT_BRANCH"
+  fi
+  exit 0
+fi
+
+# Optional positional base-branch override
+if [ -n "$1" ]; then
+  BASE_BRANCH="$1"
+fi
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# ---------------------------------------------------------------------------
+# Safety checks (run for both real and dry-run modes)
+# ---------------------------------------------------------------------------
+
+# SAFETY 0: Detect unresolved conflicts from a previous operation
+GIT_DIR=$(git rev-parse --git-dir)
+if [ -f "$GIT_DIR/CHERRY_PICK_HEAD" ] || [ -f "$GIT_DIR/MERGE_HEAD" ] || \
+   [ -f "$GIT_DIR/REBASE_HEAD" ] || [ -d "$GIT_DIR/rebase-merge" ] || \
+   [ -d "$GIT_DIR/rebase-apply" ]; then
+  echo "ERROR: You have an unfinished Git operation (merge/cherry-pick/rebase)."
+  echo "Resolve or abort it first, e.g.:"
+  echo "  git cherry-pick --continue   # or --abort"
+  echo "  git rebase --continue        # or --abort"
+  echo "  git merge --continue         # or --abort"
+  exit 1
+fi
+
+# SAFETY 1: Block detached HEAD
+if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+  echo "ERROR: You are in a detached HEAD state. Checkout a branch first."
+  exit 1
+fi
+
+# SAFETY 2: Ensure we are NOT on the base branch
+if [ "$CURRENT_BRANCH" = "$BASE_BRANCH" ]; then
+  echo "ERROR: You are on '$BASE_BRANCH'. Switch to your feature branch first."
+  exit 1
+fi
+
+# SAFETY 3: Ensure tracked files are clean (no uncommitted/staged changes)
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: You have uncommitted or staged changes. Commit or stash them first."
+  exit 1
+fi
+
+echo "Source branch: $CURRENT_BRANCH"
+echo "Base branch:   $BASE_BRANCH"
+echo "Working tree is clean."
+
+# Check that origin remote exists
+if ! git remote get-url origin &>/dev/null; then
+  echo "ERROR: No 'origin' remote found. Add one or pass a different base."
+  exit 1
+fi
+
+# Fetch latest base from origin (read-only; does not move your local base ref)
+git fetch origin "$BASE_BRANCH"
+
+# SAFETY 4: Identify commits unique to this branch (patch-id aware via git cherry)
+COMMITS=$(git cherry "origin/$BASE_BRANCH" "$CURRENT_BRANCH" | awk '/^\+/ {print $2}')
+COUNT=$(echo "$COMMITS" | tr -s ' ' '\n' | grep -c '^[0-9a-f]' || true)
+
+# SAFETY 5: Enforce exactly one commit
+if [ "$COUNT" -eq 0 ]; then
+  echo "No commits to replay. Your branch is already up to date with 'origin/$BASE_BRANCH'."
+  exit 0
+fi
+
+if [ "$COUNT" -gt 1 ]; then
+  echo "ERROR: You have $COUNT commits to replay. git restack requires exactly ONE."
+  echo ""
+  echo "git restack is designed for the single-commit PR workflow: one branch, one"
+  echo "logical change, one commit. This keeps history linear and makes rebasing"
+  echo "onto a moving base trivial and conflict-minimal."
+  echo ""
+  echo "Please squash your $COUNT commits into one before restacking:"
+  echo "  git reset --soft origin/$BASE_BRANCH"
+  echo "  git commit -m \"<your single commit message>\""
+  echo ""
+  echo "Then run git restack again."
+  exit 1
+fi
+
+COMMIT=$(echo "$COMMITS" | head -1 | xargs)
+echo "Found exactly one commit to replay: $COMMIT"
+
+# ---------------------------------------------------------------------------
+# DRY RUN: simulate against a throwaway branch, never touch local base or HEAD
+# ---------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 1 ]; then
+  TEMP_BRANCH="restack-dryrun-$$"
+  echo ""
+  echo "DRY RUN: simulating on temporary branch '$TEMP_BRANCH' from origin/$BASE_BRANCH"
+  echo "Your branch '$CURRENT_BRANCH' and your local '$BASE_BRANCH' will NOT be modified."
+
+  # Ensure we always return to the original branch and remove the temp branch on exit.
+  trap 'git checkout "$CURRENT_BRANCH" 2>/dev/null; git branch -D "$TEMP_BRANCH" 2>/dev/null' EXIT
+
+  # Create the temp branch pointing at the fetched origin base, then try the pick.
+  git checkout -b "$TEMP_BRANCH" "origin/$BASE_BRANCH" >/dev/null
+
+  if git cherry-pick "$COMMIT" >/dev/null 2>&1; then
+    RESULT="SUCCESS — replay applies cleanly"
+  else
+    RESULT="CONFLICT — replay would require manual resolution"
+    git cherry-pick --abort >/dev/null 2>&1 || true
+  fi
+
+  echo ""
+  echo "DRY RUN RESULT: $RESULT"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# REAL RUN
+# ---------------------------------------------------------------------------
+
+# SAFETY 6: Take a backup ref before any destructive operation.
+BACKUP_REF="backup/${CURRENT_BRANCH}-$(date +%s)"
+git branch "$BACKUP_REF"
+echo "Backup created: $BACKUP_REF (delete later with: git branch -D $BACKUP_REF)"
+
+# Reset this branch onto the freshly fetched base, then replay the single commit.
+# We reset directly onto origin/$BASE_BRANCH so we never checkout/mutate local base.
+echo "Resetting '$CURRENT_BRANCH' onto origin/$BASE_BRANCH..."
+git reset --hard "origin/$BASE_BRANCH"
+
+echo "Replaying commit $COMMIT..."
+if ! git cherry-pick "$COMMIT"; then
+  echo ""
+  echo "CONFLICT DETECTED during git restack."
+  echo ""
+  echo "Your branch is reset to origin/$BASE_BRANCH; only this commit remains to apply."
+  echo "To resolve:"
+  echo "  1. Fix the conflicts in your editor"
+  echo "  2. git add ."
+  echo "  3. git restack --continue"
+  echo ""
+  echo "To abort and restore your previous state:"
+  echo "  git cherry-pick --abort"
+  echo "  git reset --hard $BACKUP_REF"
+  echo ""
+  exit 1
+fi
+
+echo ""
+echo "Done! '$CURRENT_BRANCH' is replayed cleanly on top of origin/$BASE_BRANCH."
+if [ "$AUTO_CLEANUP" -eq 1 ]; then
+  git branch -D "$BACKUP_REF"
+  echo "Backup ref deleted (--auto-cleanup)."
+else
+  echo "Backup of the previous state is at: $BACKUP_REF"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
+# Push guidance (this script does NOT push for you)
+# ---------------------------------------------------------------------------
+# History was rewritten. What the next push looks like depends on whether the
+# branch already exists on the remote.
+if git rev-parse --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH" >/dev/null; then
+  echo "NOTE: history was rewritten and this branch already exists on origin."
+  echo "Your next push must force-update it (safely):"
+  echo "  git push --force-with-lease origin $CURRENT_BRANCH"
+else
+  echo "NOTE: this branch is not on origin yet. Publish it with:"
+  echo "  git push -u origin $CURRENT_BRANCH"
+fi
